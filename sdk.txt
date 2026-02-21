@@ -1,0 +1,6 @@
+yolo.segment_camera
+arm.move_delta
+arm.move_to
+gripper.open
+sensors.get_depth_image
+display.show_status
