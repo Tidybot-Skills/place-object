@@ -29,7 +29,7 @@ import math
 # Configuration
 # ============================================================================
 
-PLACE_TARGET = "red plate"
+PLACE_TARGET = "red circular plate"
 
 CAMERA_ID = "309622300814"
 DETECTION_CONFIDENCE = 0.15
@@ -52,6 +52,7 @@ DESCEND_PAUSE_PIXELS = 80
 
 # --- Place parameters ---
 PLACE_Z = -0.35
+PLACE_DEPTH_THRESHOLD = 0.35  # Release when depth to target < this (meters)
 PLACE_DESCEND_STEP_M = 0.03
 PLACE_PIXEL_TOLERANCE = 40
 PLACE_LOST_RETRIES = 5
@@ -80,6 +81,25 @@ def detect_object_mask_only(target: str, confidence: float = DETECTION_CONFIDENC
     if not detections:
         return None, None
     # Filter to mask-only detections
+    masked = [d for d in detections if d.mask is not None and (d.mask > 0.5).sum() > 0]
+    if not masked:
+        return None, None
+    best = max(masked, key=lambda d: d.area if d.area > 0 else
+               (d.bbox[2] - d.bbox[0]) * (d.bbox[3] - d.bbox[1]))
+    return best, result.image_shape
+
+
+def detect_object_3d(target: str, confidence: float = DETECTION_CONFIDENCE):
+    """Detect target with 3D depth. Returns best masked detection + depth."""
+    result = yolo.segment_camera_3d(
+        target, camera_id=CAMERA_ID, confidence=confidence,
+        save_visualization=True, mask_format="npz",
+    )
+    detections = result.get_by_class(target)
+    if not detections:
+        detections = result.detections
+    if not detections:
+        return None, None
     masked = [d for d in detections if d.mask is not None and (d.mask > 0.5).sum() > 0]
     if not masked:
         return None, None
@@ -185,10 +205,14 @@ def servo_above_place(target: str):
 def descend_to_place(target: str):
     """Descend while keeping centered on place target.
 
+    Uses 3D detection (depth) to determine when to release:
+    - Release when target is centered AND depth < PLACE_DEPTH_THRESHOLD
+    - Falls back to PLACE_Z height if depth is unavailable
     Mask-only detection: as long as mask is visible, keep tracking.
     """
     ee_x, ee_y, ee_z = sensors.get_ee_position()
-    print(f"\n--- Descend-to-Place: going to Z={PLACE_Z:.3f}m (mask-only) ---")
+    print(f"\n--- Descend-to-Place: depth threshold={PLACE_DEPTH_THRESHOLD}m, "
+          f"fallback Z={PLACE_Z:.3f}m ---")
     print(f"  Current EE Z: {ee_z:.3f}m")
 
     consecutive_misses = 0
@@ -198,11 +222,13 @@ def descend_to_place(target: str):
         ee_x, ee_y, ee_z = sensors.get_ee_position()
         remaining = ee_z - PLACE_Z
 
+        # Fallback: if we've reached the fixed Z height, release
         if remaining <= PLACE_HEIGHT_THRESHOLD:
-            print(f"  Reached place height (Z={ee_z:.3f}m). Ready to release!")
+            print(f"  Reached fallback place height (Z={ee_z:.3f}m). Ready to release!")
             return True
 
-        det, shape = detect_object_mask_only(target)
+        # Use 3D detection for depth info
+        det, shape = detect_object_3d(target)
 
         if det is None:
             consecutive_misses += 1
@@ -221,8 +247,19 @@ def descend_to_place(target: str):
         v_err = obj_v - cy
         error_mag = np.sqrt(u_err**2 + v_err**2)
 
+        # Get depth info
+        depth = det.depth_meters if hasattr(det, 'depth_meters') else float('nan')
+        depth_valid = not math.isnan(depth)
+        depth_str = f"depth={depth:.3f}m" if depth_valid else "depth=NaN"
+
         print(f"  Iter {i+1}: err=({u_err:.0f},{v_err:.0f}) |{error_mag:.0f}px| "
-              f"[mask] Z={ee_z:.3f}m remain={remaining*100:.1f}cm")
+              f"[mask] Z={ee_z:.3f}m {depth_str} remain={remaining*100:.1f}cm")
+
+        # Depth-based release: centered + close enough
+        if depth_valid and depth < PLACE_DEPTH_THRESHOLD and error_mag < PLACE_PIXEL_TOLERANCE:
+            print(f"  DEPTH RELEASE: target at {depth:.3f}m < {PLACE_DEPTH_THRESHOLD}m "
+                  f"and centered ({error_mag:.0f}px). Ready to release!")
+            return True
 
         dx_lat, dy_lat, _ = pixel_error_to_ee_delta(u_err, v_err)
 
