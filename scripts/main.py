@@ -209,6 +209,7 @@ def descend_to_place(target: str):
     - Release when target is centered AND depth < PLACE_DEPTH_THRESHOLD
     - Falls back to PLACE_Z height if depth is unavailable
     Mask-only detection: as long as mask is visible, keep tracking.
+    Monitors gripper object_detected state to catch premature drops.
     """
     ee_x, ee_y, ee_z = sensors.get_ee_position()
     print(f"\n--- Descend-to-Place: depth threshold={PLACE_DEPTH_THRESHOLD}m, "
@@ -221,6 +222,12 @@ def descend_to_place(target: str):
     for i in range(MAX_SERVO_ITERATIONS):
         ee_x, ee_y, ee_z = sensors.get_ee_position()
         remaining = ee_z - PLACE_Z
+
+        # Check if object was dropped prematurely during descent
+        if not sensors.is_gripper_holding():
+            print(f"  WARNING: Object lost during descent (gripper no longer holding)! "
+                  f"Z={ee_z:.3f}m")
+            return "dropped"
 
         # Fallback: if we've reached the fixed Z height, release
         if remaining <= PLACE_HEIGHT_THRESHOLD:
@@ -301,11 +308,21 @@ def descend_to_place(target: str):
 def place_object(target: str = PLACE_TARGET):
     """Place held object onto target using visual servoing.
 
-    Assumes the robot is already holding an object.
+    Checks gripper object state before starting. If not holding, aborts early.
     Goes home, tilts camera, detects target from height (sees past held object),
     servos above target, descends while tracking, releases.
+    Monitors object state throughout to detect premature drops.
     """
     print(f"=== Place Object on '{target}' ===\n")
+
+    # --- Pre-check: verify gripper is holding an object ---
+    holding = sensors.is_gripper_holding()
+    print(f"Pre-check: gripper holding = {holding}")
+    if not holding:
+        print("  ERROR: Gripper is not holding an object. Aborting place.")
+        display.show_face("sad")
+        display.show_text("Nothing to place!")
+        return False
 
     # --- Go home (holding object high) ---
     print("Phase 1: Going home (holding object high)...")
@@ -313,6 +330,14 @@ def place_object(target: str = PLACE_TARGET):
     display.show_face("thinking")
     arm.go_home()
     time.sleep(0.5)
+
+    # Recheck after moving home — object may have slipped
+    if not sensors.is_gripper_holding():
+        print("  WARNING: Object lost after go_home! Aborting place.")
+        display.show_face("sad")
+        display.show_text("Object dropped!")
+        arm.go_home()
+        return False
 
     # --- Tilt camera down ---
     print("Phase 2: Tilting camera down...")
@@ -344,16 +369,33 @@ def place_object(target: str = PLACE_TARGET):
     # --- Descend to place height ---
     print("\nPhase 5: Descending to place height...")
     display.show_text(f"Lowering to {target}...")
-    descend_to_place(target)
+    descent_result = descend_to_place(target)
+
+    if descent_result == "dropped":
+        print("\nObject was dropped during descent!")
+        display.show_face("sad")
+        display.show_text("Object dropped during descent!")
+        arm.go_home()
+        time.sleep(0.5)
+        return False
 
     # --- Release ---
     print("\nPhase 6: Releasing object...")
     display.show_text("Releasing...")
     gripper.open()
     time.sleep(0.5)
-    print("  Object released!")
-    display.show_face("happy")
-    display.show_text(f"Placed on {target}!")
+
+    # Verify object was released (gripper should no longer detect object)
+    still_holding = sensors.is_gripper_holding()
+    if still_holding:
+        print("  WARNING: Gripper still reports object after release. "
+              "Object may be stuck.")
+        display.show_face("thinking")
+        display.show_text("Object may be stuck...")
+    else:
+        print("  Object released! (confirmed by gripper state)")
+        display.show_face("happy")
+        display.show_text(f"Placed on {target}!")
 
     # --- Go home ---
     print("\nPhase 7: Going home...")
@@ -362,7 +404,7 @@ def place_object(target: str = PLACE_TARGET):
 
     print(f"\n=== Place complete! ===")
     display.show_face("excited")
-    return True
+    return not still_holding
 
 
 # ============================================================================
